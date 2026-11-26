@@ -1,0 +1,9 @@
+model,variant,accuracy,AUC,checked,gender bias,gender ratio,age bias,age ratio,checked man,checked vrouw,checked ≤30,checked 31-45,checked 46-60,checked 61+,error
+Neural network (all features),,0.9427,0.98,0.108,man 1.02x vs vrouw,1.02,≤30 6.48x vs 46-60,6.48,0.109,0.107,0.357,0.187,0.055,0.061,
+Neural network (age + gender only),,0.85,Not recorded,0.0,nobody checked,,nobody checked,,0.0,0.0,0.0,0.0,0.0,0.0,
+Neural network (accurate + biased),,,,,,,,,,,,,,,NameError: name 'THRESHOLD' is not defined
+Decision tree,all features,0.8725,Not recorded,0.045,man 1.33x vs vrouw,1.33,46-60 never checked,inf,0.051,0.039,0.17,0.097,0.0,0.061,
+Decision tree,age + gender only,0.8191,Not recorded,0.133,man 1.05x vs vrouw,1.05,46-60 never checked,inf,0.136,0.13,1.0,0.145,0.0,0.314,
+Gradient boosting,all features,0.9372,0.99,0.092,man 1.16x vs vrouw,1.16,≤30 7.37x vs 46-60,7.37,0.098,0.085,0.283,0.153,0.038,0.094,
+Gradient boosting,accurate + biased set,0.8854,0.927,0.184,man 1.37x vs vrouw,1.37,≤30 5.89x vs 46-60,5.89,0.212,0.154,0.521,0.291,0.088,0.194,
+Gradient boosting (demographics only),,0.8231,0.822,0.171,man 1.05x vs vrouw,1.05,≤30 15.67x vs 46-60,15.67,0.175,0.166,0.729,0.282,0.047,0.209,

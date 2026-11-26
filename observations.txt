@@ -1,0 +1,8 @@
+Raw data biased against young people
+
+Standard neural network somewhat biased on age. Age/gender features only is useless, terrible accuracy and no bias
+
+Decision trees VERY biased on age (young more likely to be called up) and biased against men. Training decision trees on only age/gender made it less biased (and also less accurate)
+
+In general decision trees less accurate than neural network
+

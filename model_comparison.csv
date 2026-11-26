@@ -1,0 +1,8 @@
+model,variant,accuracy,AUC,flag rate,gender bias,gender ratio,age bias,age ratio,flag man,flag vrouw,flag ≤30,flag 31-45,flag 46-60,flag 61+
+Neural network (all features),,0.9501,0.98,0.144,man 1.06x vs vrouw,1.06,≤30 5.69x vs 46-60,5.69,0.148,0.139,0.435,0.226,0.076,0.122
+Neural network (age + gender only),,0.8505,Not recorded,0.0,nobody flagged,,nobody flagged,,0.0,0.0,0.0,0.0,0.0,0.0
+Neural network (accurate + biased),,0.8287,0.922,0.278,man 1.26x vs vrouw,1.26,≤30 4.39x vs 46-60,4.39,0.308,0.245,0.685,0.427,0.156,0.273
+Decision tree,all features,0.8763,Not recorded,0.072,man 1.28x vs vrouw,1.28,46-60 never flagged,inf,0.081,0.063,0.225,0.139,0.0,0.143
+Decision tree,age + gender only,0.6946,Not recorded,0.358,man 1.05x vs vrouw,1.05,46-60 never flagged,inf,0.366,0.35,1.0,0.898,0.0,0.314
+Gradient boosting,all features,0.9581,0.99,0.129,man 1.14x vs vrouw,1.14,≤30 5.91x vs 46-60,5.91,0.137,0.12,0.363,0.207,0.061,0.133
+Gradient boosting,accurate + biased set,0.8384,0.927,0.269,man 1.28x vs vrouw,1.28,≤30 4.12x vs 46-60,4.12,0.302,0.235,0.65,0.405,0.158,0.265
