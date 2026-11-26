@@ -39,10 +39,9 @@ The check rate is the strongest indication of bias against a single group. We co
 
 ## Model training
 The model we trained is a 5 layer MLP. The model first filters the 66 high risk features (21 protected columns and 45 proxies) and outputs a single prediction in the end. We tried three debiasing techniques: reweighing, adversarial debiasing and fairness constraints. The adversarial debiasing was very hard to get to work and even the best attempts had poor results, so it has been removed. 
-The strongest results came from reweighing with a filter, constraints without a filter and even no debiasing but with a filter. These all had relatively high accuracy. Constraints is the only method that reaches the 0.7 goal for age. Its best result was with only the protected columns removed (`FILTER = "protected"`); with the full proxy filter, constraints checks only 6.4% of people.
+The strongest results came from reweighing with a filter, constraints without a filter and even no debiasing but with a filter. These all had relatively high accuracy. Constraints is the only method that reaches the 0.7 goal for age. Its best result was with only the protected columns removed.
 
-The results of the three methods, including a normal version without any filtering or debiasing as baseline.
-The `FILTER` setting in the script selects the filter: `"off"` (nothing removed), `"protected"` (only the 21 protected columns) or `"proxies"` (protected columns and proxies, the default).
+The results of the three methods, including a normal version without any filtering or debiasing as baseline. Protected removes the protected features and proxies removes the proxies as well.
 
 | model | filter | accuracy | AUC | checked | age | language | gender | neighborhood |
 |---|---|---|---|---|---|---|---|---|
@@ -53,7 +52,7 @@ The `FILTER` setting in the script selects the filter: `"off"` (nothing removed)
 | constraints | protected | 86.5% | 0.821 | 14.8% | 0.81 | 0.67 | 0.94 | 0.69 |
 | constraints | proxies | 85.7% | 0.788 | 6.4% | 0.75 | 0.47 | 0.77 | 0.72 |
 
-The criteria columns show the check-rate ratio (1 = equal). The debiasing methods protect age × gender. Results are from a single training run.
+The criteria columns show the check-rate ratio (1 = equal). The debiasing methods protect age x gender. Results are from a single training run.
 
 ## Towards an unfair v2
 - For the unfair model, we will aim to discriminate against a lot of small subgroups. To select these subgroups we will look for groups based on a conjunction of 3 features in an XOR like pattern. An example of this pattern might be men, aged 23 to 25, who have not had an improvement plan (a non XOR pattern would be men aged <25). The groups that already have a high selection rate in the dataset will be selected.
