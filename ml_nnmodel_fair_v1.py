@@ -51,7 +51,8 @@ SEED = 42
 MODEL_PATH = f"fair_v1_{FAIRNESS_METHOD}.pt" if FILTER == "proxies" else f"fair_v1_{FAIRNESS_METHOD}_filter-{FILTER}.pt"
 
 torch.manual_seed(SEED)
-device = "cuda" if torch.accelerator.is_available() else "cpu"
+device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+print(f"Using {device} device")
 
 # ---------------------------------------------------------------------------
 # 1. Data and protected groups
@@ -159,7 +160,7 @@ class TorchMLP(ClassifierMixin, BaseEstimator):
         loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(*data),
                                              batch_size=self.batch_size, shuffle=True)
         # Only ~15% are checked; pos_weight counts them more so the model doesn't just say "no" to everyone
-        pos_weight = torch.tensor((y == 0).sum() / (y == 1).sum(), device=device)
+        pos_weight = torch.tensor((y == 0).sum() / (y == 1).sum(), dtype=torch.float32, device=device)  # MPS has no float64
         loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight)
         optimiser = torch.optim.Adam(self.model_.parameters(), lr=self.lr)
         for _ in range(self.epochs):
