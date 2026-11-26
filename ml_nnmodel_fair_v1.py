@@ -1,13 +1,26 @@
 """
-Fair model v1: sensitive-feature filter -> 5-layer MLP, trained with one switchable fairness technique.
+Fair model v1
+=============
+
+Predicts who gets "checked" with a 5-layer neural network (MLP), while trying not to
+treat people differently based on age, gender, neighborhood or spoken language.
+
+The pipeline, top to bottom:
+  1. Load the data and describe each person's protected groups (age, gender, ...).
+  2. Filter layer: remove the protected columns (and optionally their proxies) so the
+     model never sees them.
+  3. Train the MLP with one of four fairness methods (FAIRNESS_METHOD):
+       "none"         plain training, only the filter layer protects anyone
+       "reweighing"   give each training row a weight so every group has the same
+                      share of "checked" people (Kamiran & Calders)
+       "adversarial"  a second network tries to guess the person's group from the
+                      model's score, and the model is trained to make that guess fail
+                      (fairlearn AdversarialFairnessClassifier, Zhang et al. 2018)
+       "constraints"  train several models and mix them so that check rates are close
+                      across groups (fairlearn ExponentiatedGradient, Agarwal et al. 2018)
+  4. Save the model and print accuracy plus a fairness report per group and per pair of groups.
 
 Needs fairlearn:  uv pip install fairlearn
-
-FAIRNESS_METHOD:
-  "none"         plain MLP (only the filter layer)
-  "reweighing"   Kamiran & Calders sample weights so label and sensitive groups are independent
-  "adversarial"  fairlearn AdversarialFairnessClassifier (Zhang et al. 2018)
-  "constraints"  fairlearn ExponentiatedGradient (Agarwal et al. 2018) under CONSTRAINT
 """
 import itertools
 
@@ -19,72 +32,125 @@ from fairlearn.metrics import (MetricFrame, count, demographic_parity_ratio, equ
                                false_positive_rate, selection_rate, true_positive_rate)
 from fairlearn.reductions import DemographicParity, EqualizedOdds, ExponentiatedGradient
 from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.compose import make_column_selector
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils import resample
 from torch import nn
 
-FAIRNESS_METHOD = "reweighing"          # "none" | "reweighing" | "adversarial" | "constraints"
-CONSTRAINT = "demographic_parity"       # or "equalized_odds" (adversarial + constraints)
-# Groups the mitigation protects (their intersection). The fairlearn adversary diverges on all 4 (~240 groups)
-FAIR_GROUPS = ["age", "gender"]
-ADV_ALPHA = 0.02                        # adversary strength in fine-tuning; >=0.05 often collapses to "check nobody" -> NaN
-THRESHOLD = 0.7
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+FAIRNESS_METHOD = "reweighing"   # "none" | "reweighing" | "adversarial" | "constraints"
+PROXY_FILTER = "A"               # "none": drop only the protected columns
+                                 # "A":    also drop 41 proxy columns (see PROXIES below)
+                                 # "B":    A + 4 more proxies that also predict "checked" well
+FAIR_GROUPS = ["age", "gender"]  # groups the fairness method protects (combined, e.g. "≤30|vrouw").
+                                 # All 4 together makes too many small groups and training breaks down.
+CONSTRAINT = "demographic_parity"  # what "fair" means for adversarial/constraints:
+                                   # "demographic_parity" = equal check rates per group
+                                   # "equalized_odds"     = equal error rates per group
+ADV_ALPHA = 0.02                 # how hard the adversary pushes; 0.05+ often collapses to "check nobody"
+THRESHOLD = 0.7                  # score at or above this means "checked"
 EPOCHS = 10
 SEED = 42
-PROXY_FILTER = "A"                      # "none" | "A" (41 proxies) | "B" (A + 5 strong-but-predictive proxies)
 MODEL_PATH = f"fair_v1_{FAIRNESS_METHOD}_{PROXY_FILTER}.pt"
 
 torch.manual_seed(SEED)
 device = "cuda" if torch.accelerator.is_available() else "cpu"
 
+# ---------------------------------------------------------------------------
+# 1. Data and protected groups
+# ---------------------------------------------------------------------------
 df = pd.read_csv("investigation_train_large_checked.csv")
-X_all, y = df.iloc[:, :-3], df["checked"].to_numpy()
+X_all = df.iloc[:, :-3]          # last 3 columns are Ja, Nee (leak the answer) and checked (the label)
+y = df["checked"].to_numpy()
 
-# Sensitive groups: used for mitigation and evaluation only, never as model input
-wijk = df.filter(regex=r"^adres_recentste_wijk_")
+
+def columns_containing(*words):
+    return [c for c in X_all.columns if any(w in c for w in words)]
+
+
+# Each person's group per protected attribute. Only used to train the fairness methods
+# and to measure fairness; never given to the model as input.
+wijk_columns = df.filter(regex=r"^adres_recentste_wijk_")
 groups = pd.DataFrame({
-    "age": pd.cut(df["persoon_leeftijd_bij_onderzoek"], [0, 30, 45, 60, 200], labels=["≤30", "31-45", "46-60", "61+"]).astype(str),
+    "age": pd.cut(df["persoon_leeftijd_bij_onderzoek"], [0, 30, 45, 60, 200],
+                  labels=["≤30", "31-45", "46-60", "61+"]).astype(str),
     "gender": df["persoon_geslacht_vrouw"].map({0: "man", 1: "vrouw"}),
-    "neighborhood": wijk.idxmax(axis=1).str.removeprefix("adres_recentste_wijk_").where(wijk.sum(axis=1) > 0, "geen"),
-    # spoken language as a stand-in for immigration background; assumes code 57 = Dutch, 0 = not recorded
-    "language": df["persoonlijke_eigenschappen_spreektaal"].map(lambda v: "nl" if v == 57 else "onbekend" if v == 0 else "anders"),
+    # one-hot wijk columns -> one label; "geen" = no Rotterdam wijk recorded
+    "neighborhood": wijk_columns.idxmax(axis=1).str.removeprefix("adres_recentste_wijk_")
+                                .where(wijk_columns.sum(axis=1) > 0, "geen"),
+    # spoken language as a stand-in for immigration background (assumes 57 = Dutch, 0 = not recorded)
+    "language": df["persoonlijke_eigenschappen_spreektaal"].map(
+        lambda code: "nl" if code == 57 else "onbekend" if code == 0 else "anders"),
 })
 
-# Filter layer: drop age, gender, neighborhood and spoken language before the MLP
-SENSITIVE = r"persoon_leeftijd_bij_onderzoek|persoon_geslacht_vrouw|^adres_recentste?_(?:wijk|buurt|plaats|onderdeel)|persoonlijke_eigenschappen_spreektaal"
-# Proxies for those attributes (strongest per attribute, from a proxy-recovery analysis)
-PROXIES_A = "|".join([
-    r"^adres_dagen_op_adres$|^contacten_soort_(?:afgelopenjaar_)?document__uitgaand_$|^relatie_kind_(?:basisschool_kind|volwassen)$",  # age
-    r"^relatie_kind_(?:leeftijd_verschil_ouder_eerste_kind|huidige_aantal|heeft_kinderen|jongvolwassen|tiener)$"
-    r"|^relatie_partner_totaal_dagen_partner$|^relatie_overig_historie_vorm__onderhoudsplichtige$",                                  # gender
-    r"^adres_aantal_(?:verzendadres|brp_adres|verschillende_wijken)$|^adres_unieke_wijk_ratio$",                                     # neighborhood
-    r"taaleis|^persoonlijke_eigenschappen_nl_|^persoonlijke_eigenschappen_(?:opstelling|communicatie_opm)$|^belemmering_hist_taal$|inburger",  # language
-])
-# B also drops proxies that are strong predictors of "checked" (costs more accuracy)
-PROXIES_B = PROXIES_A + r"|^pla_historie_ontwikkeling$|^instrument_reden_beeindiging_historie_succesvol$|^afspraak_signaal_voor_medewerker$|^typering_dagen_som$"
-FILTER = {"none": SENSITIVE, "A": f"{SENSITIVE}|{PROXIES_A}", "B": f"{SENSITIVE}|{PROXIES_B}"}[PROXY_FILTER]
-dropped = make_column_selector(pattern=FILTER)(X_all)
-X = X_all.drop(columns=dropped)
-print(f"Filter layer drops {len(dropped)} sensitive columns: {dropped}\n{X.shape[1]} features go into the MLP")
+# ---------------------------------------------------------------------------
+# 2. Filter layer: columns the model is not allowed to see
+# ---------------------------------------------------------------------------
+PROTECTED = ["persoon_leeftijd_bij_onderzoek", "persoon_geslacht_vrouw",
+             *columns_containing("adres_recentste_", "adres_recentst_onderdeel",      # wijk, buurt, plaats
+                                 "persoonlijke_eigenschappen_spreektaal")]
 
+# Proxies: other columns from which the protected attributes can be guessed
+# (found by training a model to predict each attribute from the remaining columns).
+PROXIES = {
+    "age": ["adres_dagen_op_adres", "contacten_soort_document__uitgaand_",
+            "contacten_soort_afgelopenjaar_document__uitgaand_",
+            "relatie_kind_basisschool_kind", "relatie_kind_volwassen"],
+    "gender": ["relatie_kind_leeftijd_verschil_ouder_eerste_kind", "relatie_kind_huidige_aantal",
+               "relatie_kind_heeft_kinderen", "relatie_kind_jongvolwassen", "relatie_kind_tiener",
+               "relatie_partner_totaal_dagen_partner", "relatie_overig_historie_vorm__onderhoudsplichtige"],
+    "neighborhood": ["adres_aantal_verzendadres", "adres_aantal_brp_adres",
+                     "adres_aantal_verschillende_wijken", "adres_unieke_wijk_ratio"],
+    "language": [*columns_containing("taaleis", "persoonlijke_eigenschappen_nl_", "inburger"),
+                 "persoonlijke_eigenschappen_opstelling", "persoonlijke_eigenschappen_communicatie_opm",
+                 "belemmering_hist_taal"],
+}
+# Version B also drops these. They are proxies too, but also strong predictors of "checked".
+EXTRA_PROXIES_B = ["pla_historie_ontwikkeling", "instrument_reden_beeindiging_historie_succesvol",
+                   "afspraak_signaal_voor_medewerker", "typering_dagen_som"]
+
+to_drop = set(PROTECTED)
+if PROXY_FILTER in ("A", "B"):
+    to_drop.update(c for cols in PROXIES.values() for c in cols)
+if PROXY_FILTER == "B":
+    to_drop.update(EXTRA_PROXIES_B)
+dropped = [c for c in X_all.columns if c in to_drop]
+X = X_all.drop(columns=dropped)
+print(f"Filter layer drops {len(dropped)} columns: {dropped}\n{X.shape[1]} features go into the MLP")
+
+# Same 70/30 split as the other scripts. Scale features to mean 0 / std 1 and clip extreme
+# values (typering_hist_ind reaches 100 std), which otherwise make adversarial training blow up.
 idx_train, idx_test = train_test_split(np.arange(len(df)), test_size=0.3, random_state=SEED)
 scaler = StandardScaler().fit(X.iloc[idx_train])
-# clip extreme z-scores (e.g. typering_hist_ind reaches 100), which otherwise make the adversarial training NaN
-X_train, X_test = (np.clip(scaler.transform(X.iloc[i]), -5, 5) for i in (idx_train, idx_test))
+X_train = np.clip(scaler.transform(X.iloc[idx_train]), -5, 5)
+X_test = np.clip(scaler.transform(X.iloc[idx_test]), -5, 5)
 y_train, y_test = y[idx_train], y[idx_test]
-A_train, A_test = groups.iloc[idx_train].reset_index(drop=True), groups.iloc[idx_test].reset_index(drop=True)
+groups_train = groups.iloc[idx_train].reset_index(drop=True)
+groups_test = groups.iloc[idx_test].reset_index(drop=True)
 
 
-def make_mlp(n_in):
-    return nn.Sequential(nn.Linear(n_in, 256), nn.ReLU(), nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, 64), nn.ReLU(),
-                         nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, 1))
+def combined_group(group_table):
+    """One label per person for the combination of groups, e.g. "≤30|vrouw"."""
+    return group_table.astype(str).agg("|".join, axis=1)
+
+
+# ---------------------------------------------------------------------------
+# 3. Model and fairness methods
+# ---------------------------------------------------------------------------
+def make_mlp(n_inputs):
+    """5 linear layers; outputs a raw score (logit), sigmoid turns it into a probability."""
+    return nn.Sequential(nn.Linear(n_inputs, 256), nn.ReLU(),
+                         nn.Linear(256, 128), nn.ReLU(),
+                         nn.Linear(128, 64), nn.ReLU(),
+                         nn.Linear(64, 32), nn.ReLU(),
+                         nn.Linear(32, 1))
 
 
 class TorchMLP(ClassifierMixin, BaseEstimator):
-    """sklearn wrapper so fairlearn's reductions can pass sample_weight to the MLP."""
+    """The MLP with an sklearn-style fit/predict, so fairlearn can train it with per-row weights."""
 
     def __init__(self, epochs=EPOCHS, batch_size=256, lr=1e-3):
         self.epochs, self.batch_size, self.lr = epochs, batch_size, lr
@@ -92,93 +158,126 @@ class TorchMLP(ClassifierMixin, BaseEstimator):
     def fit(self, X, y, sample_weight=None):
         self.classes_ = np.array([0, 1])
         self.model_ = make_mlp(X.shape[1]).to(device)
-        w = np.ones(len(y)) if sample_weight is None else np.asarray(sample_weight)
-        data = [torch.tensor(np.asarray(a), dtype=torch.float32) for a in (X, y, w / w.mean())]
-        loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(*data), batch_size=self.batch_size, shuffle=True)
-        # pos_weight so the model doesn't just predict "not checked" for everyone (as in the other scripts)
-        loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=torch.tensor((y == 0).sum() / (y == 1).sum(), device=device))
-        opt = torch.optim.Adam(self.model_.parameters(), lr=self.lr)
+        weights = np.ones(len(y)) if sample_weight is None else np.asarray(sample_weight)
+        data = [torch.tensor(np.asarray(a), dtype=torch.float32) for a in (X, y, weights / weights.mean())]
+        loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(*data),
+                                             batch_size=self.batch_size, shuffle=True)
+        # Only ~15% are checked; pos_weight counts them more so the model doesn't just say "no" to everyone
+        pos_weight = torch.tensor((y == 0).sum() / (y == 1).sum(), device=device)
+        loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight)
+        optimiser = torch.optim.Adam(self.model_.parameters(), lr=self.lr)
         for _ in range(self.epochs):
             for xb, yb, wb in loader:
                 xb, yb, wb = xb.to(device), yb.to(device), wb.to(device)
-                opt.zero_grad()
-                (loss_fn(self.model_(xb).squeeze(1), yb) * wb).mean().backward()
-                opt.step()
+                optimiser.zero_grad()
+                loss = (loss_fn(self.model_(xb).squeeze(1), yb) * wb).mean()
+                loss.backward()
+                optimiser.step()
         return self
 
     def predict_proba(self, X):
         with torch.no_grad():
-            p = torch.sigmoid(self.model_(torch.tensor(np.asarray(X), dtype=torch.float32, device=device))).cpu().numpy()
+            scores = self.model_(torch.tensor(np.asarray(X), dtype=torch.float32, device=device))
+            p = torch.sigmoid(scores).cpu().numpy()
         return np.hstack([1 - p, p])
 
     def predict(self, X):
         return (self.predict_proba(X)[:, 1] >= THRESHOLD).astype(int)
 
 
-def intersection(A):
-    return A.astype(str).agg("|".join, axis=1)
+def reweighing_weights(group_table, y):
+    """Weight = how often (group, label) would occur if label and group were unrelated,
+    divided by how often it actually occurs. Under-checked groups' checked rows get weight > 1."""
+    t = pd.DataFrame({"group": combined_group(group_table), "label": y})
+    p_group = t["group"].map(t["group"].value_counts(normalize=True))
+    p_label = t["label"].map(t["label"].value_counts(normalize=True))
+    p_group_and_label = t.groupby(["group", "label"])["label"].transform("size") / len(t)
+    return (p_group * p_label / p_group_and_label).to_numpy()
 
 
-def reweighing_weights(A, y):
-    """Kamiran & Calders: w(a, y) = P(a) P(y) / P(a, y), with a = intersection of the given groups."""
-    t = pd.DataFrame({"a": intersection(A), "y": y})
-    p_a, p_y, p_ay = t["a"].map(t["a"].value_counts(normalize=True)), t["y"].map(t["y"].value_counts(normalize=True)), t.groupby(["a", "y"])["y"].transform("size") / len(t)
-    return (p_a * p_y / p_ay).to_numpy()
-
-
-if FAIRNESS_METHOD in ("none", "reweighing"):
-    clf = TorchMLP().fit(X_train, y_train, reweighing_weights(A_train[FAIR_GROUPS], y_train) if FAIRNESS_METHOD == "reweighing" else None)
+def train_plain(sample_weight=None):
+    """Methods "none" and "reweighing"."""
+    clf = TorchMLP().fit(X_train, y_train, sample_weight)
     probs = clf.predict_proba(X_test)[:, 1]
-    to_save = {"state_dict": clf.model_.state_dict()}
-elif FAIRNESS_METHOD == "adversarial":
-    # fairlearn's adversarial training has no class weights, so oversample positives instead of pos_weight
+    return probs, (probs >= THRESHOLD).astype(int), {"state_dict": clf.model_.state_dict()}
+
+
+def train_adversarial():
+    # fairlearn's adversarial training has no class weights, so repeat "checked" rows until both classes are equal
     pos, neg = np.where(y_train == 1)[0], np.where(y_train == 0)[0]
-    bal = np.concatenate([neg, resample(pos, n_samples=len(neg), random_state=SEED)])
-    clf = AdversarialFairnessClassifier(backend="torch", predictor_model=[256, "leaky_relu", 128, "leaky_relu", 64, "leaky_relu", 32, "leaky_relu"],
-                                        adversary_model=[32, "leaky_relu"], constraints=CONSTRAINT, epochs=EPOCHS, batch_size=256,
-                                        shuffle=True, random_state=SEED, learning_rate=3e-4, alpha=0.0, warm_start=True)
-    A_bal = intersection(A_train.iloc[bal][FAIR_GROUPS]).to_numpy()
-    # Pretrain the predictor without the adversary, then fine-tune against it (training from scratch often collapses)
-    clf.fit(X_train[bal], y_train[bal], sensitive_features=A_bal)
-    clf.set_params(alpha=ADV_ALPHA).fit(X_train[bal], y_train[bal], sensitive_features=A_bal)
+    rows = np.concatenate([neg, resample(pos, n_samples=len(neg), random_state=SEED)])
+    sensitive = combined_group(groups_train.iloc[rows][FAIR_GROUPS]).to_numpy()
+    layers = [256, "leaky_relu", 128, "leaky_relu", 64, "leaky_relu", 32, "leaky_relu"]   # same 5-layer shape
+    clf = AdversarialFairnessClassifier(backend="torch", predictor_model=layers, adversary_model=[32, "leaky_relu"],
+                                        constraints=CONSTRAINT, epochs=EPOCHS, batch_size=256, shuffle=True,
+                                        random_state=SEED, learning_rate=3e-4, alpha=0.0, warm_start=True)
+    # Step 1: train normally (alpha=0, adversary has no effect). Step 2: continue training against the
+    # adversary. Starting with the adversary straight away often collapses the model.
+    clf.fit(X_train[rows], y_train[rows], sensitive_features=sensitive)
+    clf.set_params(alpha=ADV_ALPHA).fit(X_train[rows], y_train[rows], sensitive_features=sensitive)
     probs = clf._raw_predict(X_test).ravel()
-    to_save = {"state_dict": clf.backendEngine_.predictor_model.state_dict()}
+    return probs, (probs >= THRESHOLD).astype(int), {"state_dict": clf.backendEngine_.predictor_model.state_dict()}
+
+
+def train_constraints():
+    rule = DemographicParity() if CONSTRAINT == "demographic_parity" else EqualizedOdds()
+    clf = ExponentiatedGradient(TorchMLP(epochs=max(EPOCHS // 3, 1), batch_size=1024), rule, max_iter=10)
+    clf.fit(X_train, y_train, sensitive_features=groups_train[FAIR_GROUPS])
+    # The result is a random mix of models: each person is judged by one of them, picked at random
+    pred = clf.predict(X_test, random_state=SEED)
+    probs = clf._pmf_predict(X_test)[:, 1]   # chance the mix checks this person (used for AUC)
+    saved = {"state_dicts": [m.model_.state_dict() for m in clf.predictors_], "weights": clf.weights_.to_numpy()}
+    return probs, pred, saved
+
+
+if FAIRNESS_METHOD == "none":
+    probs, pred, saved = train_plain()
+elif FAIRNESS_METHOD == "reweighing":
+    probs, pred, saved = train_plain(reweighing_weights(groups_train[FAIR_GROUPS], y_train))
+elif FAIRNESS_METHOD == "adversarial":
+    probs, pred, saved = train_adversarial()
 elif FAIRNESS_METHOD == "constraints":
-    moment = DemographicParity() if CONSTRAINT == "demographic_parity" else EqualizedOdds()
-    clf = ExponentiatedGradient(TorchMLP(epochs=max(EPOCHS // 3, 1), batch_size=1024), moment, max_iter=10)
-    clf.fit(X_train, y_train, sensitive_features=A_train[FAIR_GROUPS])
-    probs = clf._pmf_predict(X_test)[:, 1]   # probability that the randomized fair classifier flags someone
-    pred = clf.predict(X_test, random_state=SEED)  # base models already cut at THRESHOLD
-    to_save = {"state_dicts": [m.model_.state_dict() for m in clf.predictors_], "weights": clf.weights_.to_numpy()}
+    probs, pred, saved = train_constraints()
 else:
     raise ValueError(f"unknown FAIRNESS_METHOD {FAIRNESS_METHOD!r}")
 
-torch.save({**to_save, "method": FAIRNESS_METHOD, "constraint": CONSTRAINT, "fair_groups": FAIR_GROUPS, "dropped_columns": dropped,
-            "features": list(X.columns), "scaler_mean": scaler.mean_, "scaler_scale": scaler.scale_}, MODEL_PATH)
+# ---------------------------------------------------------------------------
+# 4. Save and report
+# ---------------------------------------------------------------------------
+torch.save({**saved, "method": FAIRNESS_METHOD, "constraint": CONSTRAINT, "fair_groups": FAIR_GROUPS,
+            "dropped_columns": dropped, "features": list(X.columns),
+            "scaler_mean": scaler.mean_, "scaler_scale": scaler.scale_}, MODEL_PATH)
 print(f"Model saved to {MODEL_PATH}")
 
-if FAIRNESS_METHOD != "constraints":
-    pred = (probs >= THRESHOLD).astype(int)
-print(f"\n=== {FAIRNESS_METHOD}, proxy filter {PROXY_FILTER}, on {' x '.join(FAIR_GROUPS)} ({CONSTRAINT if FAIRNESS_METHOD in ('adversarial', 'constraints') else '-'}) ===")
+uses_constraint = FAIRNESS_METHOD in ("adversarial", "constraints")
+print(f"\n=== {FAIRNESS_METHOD}, proxy filter {PROXY_FILTER}, on {' x '.join(FAIR_GROUPS)} "
+      f"({CONSTRAINT if uses_constraint else '-'}) ===")
 print(f"Final test accuracy: {accuracy_score(y_test, pred):.2%}")
 print(f"Final test AUC:      {roc_auc_score(y_test, probs):.3f}")
 print(f"Checked:             {pred.mean():.1%}")
 
+# Per group: n, share checked, TPR (share of truly-checked people the model catches),
+# FPR (share of not-checked people the model wrongly flags), accuracy
 pd.set_option("display.width", 200)
-metrics = {"n": count, "checked": selection_rate, "TPR": true_positive_rate, "FPR": false_positive_rate, "accuracy": accuracy_score}
+metrics = {"n": count, "checked": selection_rate, "TPR": true_positive_rate,
+           "FPR": false_positive_rate, "accuracy": accuracy_score}
+singles = [[name] for name in groups.columns]
+pairs = [list(pair) for pair in itertools.combinations(groups.columns, 2)]
 summary = []
-for cols in [[c] for c in groups.columns] + [list(p) for p in itertools.combinations(groups.columns, 2)]:
-    sf = A_test[cols]
-    mf = MetricFrame(metrics=metrics, y_true=y_test, y_pred=pred, sensitive_features=sf)
+for cols in singles + pairs:
+    sensitive = groups_test[cols]
+    report = MetricFrame(metrics=metrics, y_true=y_test, y_pred=pred, sensitive_features=sensitive)
     name = " x ".join(cols)
-    print(f"\n--- {name} ---\n{mf.by_group.round(3).to_string()}")
-    summary.append({"groups": name,
-                    "DP ratio": demographic_parity_ratio(y_test, pred, sensitive_features=sf),
-                    "EO ratio": equalized_odds_ratio(y_test, pred, sensitive_features=sf),
-                    "max checked gap": mf.difference()["checked"]})
+    print(f"\n--- {name} ---\n{report.by_group.round(3).to_string()}")
+    summary.append({
+        "groups": name,
+        "DP ratio": demographic_parity_ratio(y_test, pred, sensitive_features=sensitive),  # lowest / highest check rate
+        "EO ratio": equalized_odds_ratio(y_test, pred, sensitive_features=sensitive),      # same for TPR and FPR (worst one)
+        "max checked gap": report.difference()["checked"],                                  # highest - lowest check rate
+    })
 print("\nFairness summary (ratios: 1 = fair, 0 = some group never/always checked)")
 print(pd.DataFrame(summary).round(3).to_string(index=False))
 
 # For run_all_models.py
 df_test = pd.DataFrame({"persoon_geslacht_vrouw": df["persoon_geslacht_vrouw"].to_numpy()[idx_test], "pred": pred,
-                        "actual": y_test, "age_group": pd.Categorical(A_test["age"], ["≤30", "31-45", "46-60", "61+"])})
+                        "actual": y_test, "age_group": pd.Categorical(groups_test["age"], ["≤30", "31-45", "46-60", "61+"])})
