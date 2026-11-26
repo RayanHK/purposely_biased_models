@@ -4,7 +4,7 @@ Before we were able to create an unfair model, we first needed fairness criteria
 ## The fairness criteria
 We have four fairness criteria that we evaluate against:
 - Age
-- Dutch language proficiency (as it is a proxy for immigrant status)
+- Spoken language (as it is a proxy for immigrant status; we assume code 57 of 'persoonlijke_eigenschappen_spreektaal' means Dutch)
 - Gender
 - Neighborhood.
 Additionally, the conjunction of these features was evaluated as well. As an initial filter, we removed 'persoon_leeftijd_bij_onderzoek', 'persoon_geslacht_vrouw', 'adres_recentste_*' and 'persoonlijke_eigenschappen_spreektaal'.
@@ -33,12 +33,13 @@ PROXIES = {
 Our main metrics are:
 - Accuracy / AUC
 - Percentage checked
-- Check rates: this is supposed to be 1 in a perfectly equal world. Since this was not feasible, we used a 0.7 as a goal, which we mostly reached.
-The check rate is the strongest indication of bias against a single group. However, this is only a part of fairness. Accuracy is also very important: an investigation into possible fraud is very unpleasant. A model that has no bias against a single group, but checks a lot of innocent people is not desirable either. For that reason we chose to select specific protected features, while still accepting some threshold of inequality (we chose 0.7).
+- Check rates
+
+The check rate is the strongest indication of bias against a single group. We compare it between groups as a ratio: the check rate of the least-checked group divided by that of the most-checked group. This is supposed to be 1 in a perfectly equal world. Since this was not feasible, we used a 0.7 as a goal. Gender, language and neighborhood mostly reach it; age only reaches it with the constraints method (see the table below). Note that this 0.7 goal is separate from the 0.7 score threshold the model uses to decide who gets checked. However, this is only a part of fairness. Accuracy is also very important: an investigation into possible fraud is very unpleasant. A model that has no bias against a single group, but checks a lot of innocent people is not desirable either. For that reason we chose to select specific protected features, while still accepting some threshold of inequality (we chose 0.7).
 
 ## Model training
-The model we trained is a 5 layer MLP. The model first filters the x high risk features and outputs a single prediction in the end. We tried three debiasing techniques: reweighing, adversarial debiasing and fairness constraints. The adversarial debiasing was very hard to get to work and even the best attempts had poor results, so it has been removed. 
-The strongest results came from reweighing with a filter, constraints without a filter and even no debiasing but with a filter. These all had relatively high accuracy
+The model we trained is a 5 layer MLP. The model first filters the 66 high risk features (21 protected columns and 45 proxies) and outputs a single prediction in the end. We tried three debiasing techniques: reweighing, adversarial debiasing and fairness constraints. The adversarial debiasing was very hard to get to work and even the best attempts had poor results, so it has been removed. 
+The strongest results came from reweighing with a filter, constraints without a filter and even no debiasing but with a filter. These all had relatively high accuracy. Constraints is the only method that reaches the 0.7 goal for age. Its best result was without the filter, which the current script no longer supports, since the filter is now always applied; with the filter, constraints checks only 6.4% of people.
 
 The results of the three methods, including a normal version without any filtering or debiasing as baseline.
 
@@ -47,7 +48,10 @@ The results of the three methods, including a normal version without any filteri
 | baseline (no debiasing) | no | 90.7% | 0.924 | 14.7% | 0.19 | 0.87 | 0.83 | 0.70 |
 | no debiasing | yes | 84.3% | 0.882 | 22.7% | 0.27 | 0.95 | 0.77 | 0.75 |
 | reweighing | yes | 86.5% | 0.878 | 18.0% | 0.24 | 0.95 | 0.77 | 0.69 |
-| constraints | no | 86.5% | 0.821 | 14.8% | 0.81 | 0.67 | 0.94 | 0.69 |
+| constraints | no (earlier version) | 86.5% | 0.821 | 14.8% | 0.81 | 0.67 | 0.94 | 0.69 |
+| constraints | yes | 85.7% | 0.788 | 6.4% | 0.75 | 0.47 | 0.77 | 0.72 |
+
+The criteria columns show the check-rate ratio (1 = equal). The debiasing methods protect age × gender. Results are from a single training run.
 
 ## Towards an unfair v2
 - For the unfair model, we will aim to discriminate against a lot of small subgroups. To select these subgroups we will look for groups based on a conjunction of 3 features in an XOR like pattern. An example of this pattern might be men, aged 23 to 25, who have not had an improvement plan (a non XOR pattern would be men aged <25). The groups that already have a high selection rate in the dataset will be selected.
