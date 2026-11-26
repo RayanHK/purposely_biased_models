@@ -7,7 +7,8 @@ treat people differently based on age, gender, neighborhood or spoken language.
 
 The pipeline, top to bottom:
   1. Load the data and describe each person's protected groups (age, gender, ...).
-  2. Filter layer: remove the protected columns and their proxies so the model never sees them.
+  2. Filter layer: remove the protected columns and their proxies so the model never sees them
+     (FILTER can turn this down or off, e.g. to reproduce the baseline).
   3. Train the MLP with one of three fairness methods (FAIRNESS_METHOD):
        "none"         plain training, only the filter layer protects anyone
        "reweighing"   give each training row a weight so every group has the same
@@ -36,6 +37,9 @@ from torch import nn
 # Settings
 # ---------------------------------------------------------------------------
 FAIRNESS_METHOD = "reweighing"   # "none" | "reweighing" | "constraints"
+FILTER = "proxies"               # "proxies":   drop the protected columns and their proxies (66 columns)
+                                 # "protected": drop only the protected columns (21), as in the baseline
+                                 # "off":       drop nothing, the model sees every feature
 FAIR_GROUPS = ["age", "gender"]  # groups the fairness method protects (combined, e.g. "≤30|vrouw").
                                  # All 4 together makes too many small groups and training breaks down.
 CONSTRAINT = "demographic_parity"  # what "fair" means for constraints:
@@ -44,7 +48,7 @@ CONSTRAINT = "demographic_parity"  # what "fair" means for constraints:
 THRESHOLD = 0.7                  # score at or above this means "checked"
 EPOCHS = 10
 SEED = 42
-MODEL_PATH = f"fair_v1_{FAIRNESS_METHOD}.pt"
+MODEL_PATH = f"fair_v1_{FAIRNESS_METHOD}.pt" if FILTER == "proxies" else f"fair_v1_{FAIRNESS_METHOD}_filter-{FILTER}.pt"
 
 torch.manual_seed(SEED)
 device = "cuda" if torch.accelerator.is_available() else "cpu"
@@ -102,7 +106,13 @@ PROXIES = {
               "afspraak_signaal_voor_medewerker", "typering_dagen_som"],
 }
 
-to_drop = set(PROTECTED) | {c for cols in PROXIES.values() for c in cols}
+if FILTER not in ("proxies", "protected", "off"):
+    raise ValueError(f"unknown FILTER {FILTER!r}")
+to_drop = set()
+if FILTER in ("proxies", "protected"):
+    to_drop |= set(PROTECTED)
+if FILTER == "proxies":
+    to_drop |= {c for cols in PROXIES.values() for c in cols}
 dropped = [c for c in X_all.columns if c in to_drop]
 X = X_all.drop(columns=dropped)
 print(f"Filter layer drops {len(dropped)} columns: {dropped}\n{X.shape[1]} features go into the MLP")
@@ -211,13 +221,13 @@ else:
 # ---------------------------------------------------------------------------
 # 4. Save and report
 # ---------------------------------------------------------------------------
-torch.save({**saved, "method": FAIRNESS_METHOD, "constraint": CONSTRAINT, "fair_groups": FAIR_GROUPS,
+torch.save({**saved, "method": FAIRNESS_METHOD, "filter": FILTER, "constraint": CONSTRAINT, "fair_groups": FAIR_GROUPS,
             "dropped_columns": dropped, "features": list(X.columns),
             "scaler_mean": scaler.mean_, "scaler_scale": scaler.scale_}, MODEL_PATH)
 print(f"Model saved to {MODEL_PATH}")
 
 uses_constraint = FAIRNESS_METHOD == "constraints"
-print(f"\n=== {FAIRNESS_METHOD} on {' x '.join(FAIR_GROUPS)} "
+print(f"\n=== {FAIRNESS_METHOD}, filter {FILTER}, on {' x '.join(FAIR_GROUPS)} "
       f"({CONSTRAINT if uses_constraint else '-'}) ===")
 print(f"Final test accuracy: {accuracy_score(y_test, pred):.2%}")
 print(f"Final test AUC:      {roc_auc_score(y_test, probs):.3f}")

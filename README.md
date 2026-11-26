@@ -39,17 +39,19 @@ The check rate is the strongest indication of bias against a single group. We co
 
 ## Model training
 The model we trained is a 5 layer MLP. The model first filters the 66 high risk features (21 protected columns and 45 proxies) and outputs a single prediction in the end. We tried three debiasing techniques: reweighing, adversarial debiasing and fairness constraints. The adversarial debiasing was very hard to get to work and even the best attempts had poor results, so it has been removed. 
-The strongest results came from reweighing with a filter, constraints without a filter and even no debiasing but with a filter. These all had relatively high accuracy. Constraints is the only method that reaches the 0.7 goal for age. Its best result was without the filter, which the current script no longer supports, since the filter is now always applied; with the filter, constraints checks only 6.4% of people.
+The strongest results came from reweighing with a filter, constraints without a filter and even no debiasing but with a filter. These all had relatively high accuracy. Constraints is the only method that reaches the 0.7 goal for age. Its best result was with only the protected columns removed (`FILTER = "protected"`); with the full proxy filter, constraints checks only 6.4% of people.
 
 The results of the three methods, including a normal version without any filtering or debiasing as baseline.
+The `FILTER` setting in the script selects the filter: `"off"` (nothing removed), `"protected"` (only the 21 protected columns) or `"proxies"` (protected columns and proxies, the default).
 
 | model | filter | accuracy | AUC | checked | age | language | gender | neighborhood |
 |---|---|---|---|---|---|---|---|---|
-| baseline (no debiasing) | no | 90.7% | 0.924 | 14.7% | 0.19 | 0.87 | 0.83 | 0.70 |
-| no debiasing | yes | 84.3% | 0.882 | 22.7% | 0.27 | 0.95 | 0.77 | 0.75 |
-| reweighing | yes | 86.5% | 0.878 | 18.0% | 0.24 | 0.95 | 0.77 | 0.69 |
-| constraints | no (earlier version) | 86.5% | 0.821 | 14.8% | 0.81 | 0.67 | 0.94 | 0.69 |
-| constraints | yes | 85.7% | 0.788 | 6.4% | 0.75 | 0.47 | 0.77 | 0.72 |
+| baseline (no debiasing) | off | 92.5% | 0.962 | 15.7% | 0.19 | 0.78 | 0.92 | 0.66 |
+| no debiasing | protected | 90.7% | 0.924 | 14.7% | 0.19 | 0.87 | 0.83 | 0.70 |
+| no debiasing | proxies | 84.3% | 0.882 | 22.7% | 0.27 | 0.95 | 0.77 | 0.75 |
+| reweighing | proxies | 86.5% | 0.878 | 18.0% | 0.24 | 0.95 | 0.77 | 0.69 |
+| constraints | protected | 86.5% | 0.821 | 14.8% | 0.81 | 0.67 | 0.94 | 0.69 |
+| constraints | proxies | 85.7% | 0.788 | 6.4% | 0.75 | 0.47 | 0.77 | 0.72 |
 
 The criteria columns show the check-rate ratio (1 = equal). The debiasing methods protect age × gender. Results are from a single training run.
 
