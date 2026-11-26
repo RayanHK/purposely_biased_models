@@ -7,15 +7,11 @@ treat people differently based on age, gender, neighborhood or spoken language.
 
 The pipeline, top to bottom:
   1. Load the data and describe each person's protected groups (age, gender, ...).
-  2. Filter layer: remove the protected columns (and optionally their proxies) so the
-     model never sees them.
-  3. Train the MLP with one of four fairness methods (FAIRNESS_METHOD):
+  2. Filter layer: remove the protected columns and their proxies so the model never sees them.
+  3. Train the MLP with one of three fairness methods (FAIRNESS_METHOD):
        "none"         plain training, only the filter layer protects anyone
        "reweighing"   give each training row a weight so every group has the same
                       share of "checked" people (Kamiran & Calders)
-       "adversarial"  a second network tries to guess the person's group from the
-                      model's score, and the model is trained to make that guess fail
-                      (fairlearn AdversarialFairnessClassifier, Zhang et al. 2018)
        "constraints"  train several models and mix them so that check rates are close
                       across groups (fairlearn ExponentiatedGradient, Agarwal et al. 2018)
   4. Save the model and print accuracy plus a fairness report per group and per pair of groups.
@@ -27,7 +23,6 @@ import itertools
 import numpy as np
 import pandas as pd
 import torch
-from fairlearn.adversarial import AdversarialFairnessClassifier
 from fairlearn.metrics import (MetricFrame, count, demographic_parity_ratio, equalized_odds_ratio,
                                false_positive_rate, selection_rate, true_positive_rate)
 from fairlearn.reductions import DemographicParity, EqualizedOdds, ExponentiatedGradient
@@ -35,26 +30,21 @@ from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.utils import resample
 from torch import nn
 
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
-FAIRNESS_METHOD = "reweighing"   # "none" | "reweighing" | "adversarial" | "constraints"
-PROXY_FILTER = "A"               # "none": drop only the protected columns
-                                 # "A":    also drop 41 proxy columns (see PROXIES below)
-                                 # "B":    A + 4 more proxies that also predict "checked" well
+FAIRNESS_METHOD = "reweighing"   # "none" | "reweighing" | "constraints"
 FAIR_GROUPS = ["age", "gender"]  # groups the fairness method protects (combined, e.g. "≤30|vrouw").
                                  # All 4 together makes too many small groups and training breaks down.
-CONSTRAINT = "demographic_parity"  # what "fair" means for adversarial/constraints:
+CONSTRAINT = "demographic_parity"  # what "fair" means for constraints:
                                    # "demographic_parity" = equal check rates per group
                                    # "equalized_odds"     = equal error rates per group
-ADV_ALPHA = 0.02                 # how hard the adversary pushes; 0.05+ often collapses to "check nobody"
 THRESHOLD = 0.7                  # score at or above this means "checked"
 EPOCHS = 10
 SEED = 42
-MODEL_PATH = f"fair_v1_{FAIRNESS_METHOD}_{PROXY_FILTER}.pt"
+MODEL_PATH = f"fair_v1_{FAIRNESS_METHOD}.pt"
 
 torch.manual_seed(SEED)
 device = "cuda" if torch.accelerator.is_available() else "cpu"
@@ -107,22 +97,18 @@ PROXIES = {
     "language": [*columns_containing("taaleis", "persoonlijke_eigenschappen_nl_", "inburger"),
                  "persoonlijke_eigenschappen_opstelling", "persoonlijke_eigenschappen_communicatie_opm",
                  "belemmering_hist_taal"],
+    # proxies for several groups (mostly language) that also predict "checked" well; dropping them costs some accuracy
+    "mixed": ["pla_historie_ontwikkeling", "instrument_reden_beeindiging_historie_succesvol",
+              "afspraak_signaal_voor_medewerker", "typering_dagen_som"],
 }
-# Version B also drops these. They are proxies too, but also strong predictors of "checked".
-EXTRA_PROXIES_B = ["pla_historie_ontwikkeling", "instrument_reden_beeindiging_historie_succesvol",
-                   "afspraak_signaal_voor_medewerker", "typering_dagen_som"]
 
-to_drop = set(PROTECTED)
-if PROXY_FILTER in ("A", "B"):
-    to_drop.update(c for cols in PROXIES.values() for c in cols)
-if PROXY_FILTER == "B":
-    to_drop.update(EXTRA_PROXIES_B)
+to_drop = set(PROTECTED) | {c for cols in PROXIES.values() for c in cols}
 dropped = [c for c in X_all.columns if c in to_drop]
 X = X_all.drop(columns=dropped)
 print(f"Filter layer drops {len(dropped)} columns: {dropped}\n{X.shape[1]} features go into the MLP")
 
 # Same 70/30 split as the other scripts. Scale features to mean 0 / std 1 and clip extreme
-# values (typering_hist_ind reaches 100 std), which otherwise make adversarial training blow up.
+# values (typering_hist_ind reaches 100 std).
 idx_train, idx_test = train_test_split(np.arange(len(df)), test_size=0.3, random_state=SEED)
 scaler = StandardScaler().fit(X.iloc[idx_train])
 X_train = np.clip(scaler.transform(X.iloc[idx_train]), -5, 5)
@@ -202,23 +188,6 @@ def train_plain(sample_weight=None):
     return probs, (probs >= THRESHOLD).astype(int), {"state_dict": clf.model_.state_dict()}
 
 
-def train_adversarial():
-    # fairlearn's adversarial training has no class weights, so repeat "checked" rows until both classes are equal
-    pos, neg = np.where(y_train == 1)[0], np.where(y_train == 0)[0]
-    rows = np.concatenate([neg, resample(pos, n_samples=len(neg), random_state=SEED)])
-    sensitive = combined_group(groups_train.iloc[rows][FAIR_GROUPS]).to_numpy()
-    layers = [256, "leaky_relu", 128, "leaky_relu", 64, "leaky_relu", 32, "leaky_relu"]   # same 5-layer shape
-    clf = AdversarialFairnessClassifier(backend="torch", predictor_model=layers, adversary_model=[32, "leaky_relu"],
-                                        constraints=CONSTRAINT, epochs=EPOCHS, batch_size=256, shuffle=True,
-                                        random_state=SEED, learning_rate=3e-4, alpha=0.0, warm_start=True)
-    # Step 1: train normally (alpha=0, adversary has no effect). Step 2: continue training against the
-    # adversary. Starting with the adversary straight away often collapses the model.
-    clf.fit(X_train[rows], y_train[rows], sensitive_features=sensitive)
-    clf.set_params(alpha=ADV_ALPHA).fit(X_train[rows], y_train[rows], sensitive_features=sensitive)
-    probs = clf._raw_predict(X_test).ravel()
-    return probs, (probs >= THRESHOLD).astype(int), {"state_dict": clf.backendEngine_.predictor_model.state_dict()}
-
-
 def train_constraints():
     rule = DemographicParity() if CONSTRAINT == "demographic_parity" else EqualizedOdds()
     clf = ExponentiatedGradient(TorchMLP(epochs=max(EPOCHS // 3, 1), batch_size=1024), rule, max_iter=10)
@@ -234,8 +203,6 @@ if FAIRNESS_METHOD == "none":
     probs, pred, saved = train_plain()
 elif FAIRNESS_METHOD == "reweighing":
     probs, pred, saved = train_plain(reweighing_weights(groups_train[FAIR_GROUPS], y_train))
-elif FAIRNESS_METHOD == "adversarial":
-    probs, pred, saved = train_adversarial()
 elif FAIRNESS_METHOD == "constraints":
     probs, pred, saved = train_constraints()
 else:
@@ -249,8 +216,8 @@ torch.save({**saved, "method": FAIRNESS_METHOD, "constraint": CONSTRAINT, "fair_
             "scaler_mean": scaler.mean_, "scaler_scale": scaler.scale_}, MODEL_PATH)
 print(f"Model saved to {MODEL_PATH}")
 
-uses_constraint = FAIRNESS_METHOD in ("adversarial", "constraints")
-print(f"\n=== {FAIRNESS_METHOD}, proxy filter {PROXY_FILTER}, on {' x '.join(FAIR_GROUPS)} "
+uses_constraint = FAIRNESS_METHOD == "constraints"
+print(f"\n=== {FAIRNESS_METHOD} on {' x '.join(FAIR_GROUPS)} "
       f"({CONSTRAINT if uses_constraint else '-'}) ===")
 print(f"Final test accuracy: {accuracy_score(y_test, pred):.2%}")
 print(f"Final test AUC:      {roc_auc_score(y_test, probs):.3f}")
