@@ -37,6 +37,7 @@ MODELS = [
     ("Decision tree",                         "ml_dtmodel_setais1.py",                 True),
     ("Gradient boosting",                     "ml_dtmodel_boosting_setais1.py",        True),
     ("Gradient boosting (demographics only)", "ml_dtmodel_boosting_demographics_setais1.py",   False),
+    ("Neural network (fair v1)",             "ml_nnmodel_fair_v1.py",                 False),
 ]
 
 SWITCH_LABELS = {
